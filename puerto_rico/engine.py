@@ -113,6 +113,11 @@ class SettlerTakeQuarryConstructionHut:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlerTakeHacienda:
+    """Hacienda: take the top face-down plantation before the normal settler pick."""
+
+
+@dataclass(frozen=True, slots=True)
 class SettlerPass:
     """Skip settler action on your turn (optional action for non-captain roles)."""
 
@@ -231,6 +236,7 @@ class RoundCleanupAdvance:
 
 EngineAction: TypeAlias = Union[
     PickRole,
+    SettlerTakeHacienda,
     SettlerTakeFaceUp,
     SettlerTakeQuarryPrivilege,
     SettlerTakeQuarryConstructionHut,
@@ -457,6 +463,68 @@ def _can_place_building_at(player: PlayerState, building: Building, anchor: int)
     return True
 
 
+def _repack_city_buildings(
+    existing: Sequence[PlacedBuilding],
+    new_building: Building,
+    new_anchor: int,
+) -> Optional[tuple[PlacedBuilding, ...]]:
+    """Return a valid city layout after adding `new_building`, relocating others if needed.
+
+    The rules permit moving buildings within the city to make room for a large building.
+    This helper only repacks geometry; building ownership and colonists stay attached
+    to their tiles.
+    """
+
+    new_width = building_city_spaces(new_building)
+    if new_anchor < 0 or new_anchor + new_width > 12:
+        return None
+    if new_width == 2 and new_anchor % 4 == 3:
+        return None
+
+    reserved = {new_anchor + i for i in range(new_width)}
+    if any(slot < 0 or slot >= 12 for slot in reserved):
+        return None
+
+    to_place = sorted(existing, key=lambda pb: (-building_city_spaces(pb.building), pb.anchor_slot, pb.building.value))
+    placed: list[PlacedBuilding] = []
+    occupied = set(reserved)
+
+    def backtrack(idx: int) -> bool:
+        if idx >= len(to_place):
+            return True
+        pb = to_place[idx]
+        width = building_city_spaces(pb.building)
+        for anchor in range(12):
+            if anchor + width > 12:
+                continue
+            if width == 2 and anchor % 4 == 3:
+                continue
+            slots = {anchor + i for i in range(width)}
+            if slots & occupied:
+                continue
+            occupied.update(slots)
+            placed.append(dataclasses.replace(pb, anchor_slot=anchor))
+            if backtrack(idx + 1):
+                return True
+            placed.pop()
+            occupied.difference_update(slots)
+        return False
+
+    if not backtrack(0):
+        return None
+
+    return tuple(
+        list(placed)
+        + [
+            PlacedBuilding(
+                building=new_building,
+                anchor_slot=new_anchor,
+                colonists=tuple(0 for _ in range(building_worker_circles(new_building))),
+            )
+        ]
+    )
+
+
 def _builder_discount(player: PlayerState, anchor_slot: int, building: Building) -> int:
     """Quarry discount capped by building column (1–4)."""
     col_cap = max_quarry_discount_for_city_slot(anchor_slot)
@@ -466,6 +534,10 @@ def _builder_discount(player: PlayerState, anchor_slot: int, building: Building)
 
 def _player_has_building(player: PlayerState, b: Building) -> bool:
     return any(pb.building == b for pb in player.city_buildings)
+
+
+def _player_get_building(player: PlayerState, b: Building) -> Optional[PlacedBuilding]:
+    return next((pb for pb in player.city_buildings if pb.building == b), None)
 
 
 def _building_supply_take(state: GameState, b: Building) -> GameState | None:
@@ -491,6 +563,149 @@ def _builder_doubloon_cost_base(
     return max(1, printed - qd)
 
 
+def _occupied_building_bonus_eligible(player: PlayerState, b: Building) -> bool:
+    pb = _player_get_building(player, b)
+    if pb is None:
+        return False
+    return building_occupied(pb)
+
+
+def _take_one_colonist_from_supply_or_ship(state: GameState) -> tuple[GameState, bool]:
+    if state.colonist_supply > 0:
+        return dataclasses.replace(state, colonist_supply=state.colonist_supply - 1), True
+    if state.colonist_ship > 0:
+        return dataclasses.replace(state, colonist_ship=state.colonist_ship - 1), True
+    return state, False
+
+
+def _draw_hacienda_plantation(state: GameState) -> tuple[GameState, Optional[IslandTile]]:
+    stacks = [list(st) for st in state.plantation_stacks]
+    for idx, stack in enumerate(stacks):
+        if not stack:
+            continue
+        tile = stack.pop()
+        return dataclasses.replace(state, plantation_stacks=tuple(tuple(st) for st in stacks)), tile
+    return state, None
+
+
+def _place_colonist_on_new_island_tile(
+    state: GameState,
+    player_index: int,
+    island_slot: int,
+) -> GameState:
+    state2, got_colonist = _take_one_colonist_from_supply_or_ship(state)
+    if not got_colonist:
+        return state
+    p = state2.players[player_index]
+    spaces = list(p.island_spaces)
+    sp = spaces[island_slot]
+    spaces[island_slot] = IslandSpace(tile=sp.tile, colonists=sp.colonists + 1)
+    return _replace_player(state2, player_index, dataclasses.replace(p, island_spaces=tuple(spaces)))
+
+
+def _maybe_apply_hospice(state: GameState, player_index: int, island_slot: int) -> GameState:
+    p = state.players[player_index]
+    if not _occupied_building_bonus_eligible(p, Building.HOSPICE):
+        return state
+    return _place_colonist_on_new_island_tile(state, player_index, island_slot)
+
+
+def _maybe_apply_university(state: GameState, player_index: int, built_building: Building) -> GameState:
+    p = state.players[player_index]
+    uni = _player_get_building(p, Building.UNIVERSITY)
+    if uni is None:
+        return state
+    if built_building is not Building.UNIVERSITY and not building_occupied(uni):
+        return state
+    state2, got_colonist = _take_one_colonist_from_supply_or_ship(state)
+    if not got_colonist:
+        return state
+    p2 = state2.players[player_index]
+    city = list(p2.city_buildings)
+    for i, pb in enumerate(city):
+        if pb.building != Building.UNIVERSITY:
+            continue
+        cols = list(pb.colonists)
+        for j, c in enumerate(cols):
+            if c == 0:
+                cols[j] = 1
+                city[i] = dataclasses.replace(pb, colonists=tuple(cols))
+                return _replace_player(state2, player_index, dataclasses.replace(p2, city_buildings=tuple(city)))
+        break
+    return state
+
+
+def _collect_player_colonists_for_mayor(player: PlayerState) -> tuple[PlayerState, int]:
+    """Return player with board/San Juan cleared and all colonists moved into a placement pool."""
+
+    pooled = player.san_juan_colonists
+
+    island_spaces: list[IslandSpace] = []
+    for sp in player.island_spaces:
+        pooled += sp.colonists
+        island_spaces.append(IslandSpace(tile=sp.tile, colonists=0 if sp.tile is not None else 0))
+
+    city_buildings: list[PlacedBuilding] = []
+    for pb in player.city_buildings:
+        pooled += sum(pb.colonists)
+        city_buildings.append(dataclasses.replace(pb, colonists=tuple(0 for _ in pb.colonists)))
+
+    return (
+        dataclasses.replace(
+            player,
+            san_juan_colonists=0,
+            island_spaces=tuple(island_spaces),
+            city_buildings=tuple(city_buildings),
+        ),
+        pooled,
+    )
+
+
+def _prepare_mayor_placement_state(
+    state: GameState,
+    pend: MayorPhasePending,
+) -> tuple[GameState, MayorPhasePending, Optional[int]]:
+    """During mayor, all colonists may be rearranged; move them into hands before placement."""
+
+    hands = list(pend.colonists_hands)
+    players = list(state.players)
+    for idx, player in enumerate(players):
+        cleared_player, pooled = _collect_player_colonists_for_mayor(player)
+        players[idx] = cleared_player
+        if idx < len(hands):
+            hands[idx] += pooled
+    pend2 = dataclasses.replace(pend, colonists_hands=tuple(hands))
+    state2 = dataclasses.replace(state, players=tuple(players), pending=pend2)
+    placement_next = PuertoRicoEngine._mayor_next_with_colonists_in_hand(
+        pend2.mayor_role_chooser, state2.num_players, pend2.colonists_hands
+    )
+    return state2, pend2, placement_next
+
+
+def _final_scoring_bonus(player: PlayerState) -> int:
+    bonus = 0
+    occupied_large = {
+        pb.building
+        for pb in player.city_buildings
+        if pb.building in LARGE_UNIQUE_BUILDINGS and building_occupied(pb)
+    }
+    if Building.GUILD_HALL in occupied_large:
+        for pb in player.city_buildings:
+            if pb.building not in PRODUCTION_BUILDINGS:
+                continue
+            bonus += 1 if pb.building in (Building.SMALL_INDIGO_PLANT, Building.SMALL_SUGAR_MILL) else 2
+    if Building.RESIDENCE in occupied_large:
+        filled = count_filled_island_spaces(player)
+        bonus += {9: 4, 10: 5, 11: 6}.get(filled, 7 if filled >= 12 else 0)
+    if Building.FORTRESS in occupied_large:
+        bonus += total_colonists_on_board(player) // 3
+    if Building.CUSTOMS_HOUSE in occupied_large:
+        bonus += player.vp_from_chips // 4
+    if Building.CITY_HALL in occupied_large:
+        bonus += sum(1 for pb in player.city_buildings if pb.building in VIOLET_BUILDINGS)
+    return bonus
+
+
 def _player_can_afford_any_build(state: GameState, player_id: int, chooser: int) -> bool:
     p = state.players[player_id]
     priv = 1 if player_id == chooser else 0
@@ -501,7 +716,10 @@ def _player_can_afford_any_build(state: GameState, player_id: int, chooser: int)
         if _player_has_building(p, b):
             continue
         for slot in range(12):
-            if not _can_place_building_at(p, b, slot):
+            if building_city_spaces(b) == 2:
+                if _repack_city_buildings(p.city_buildings, b, slot) is None:
+                    continue
+            elif not _can_place_building_at(p, b, slot):
                 continue
             cost = _builder_doubloon_cost_base(p, b, slot, quarry_discount_applies=quarry_ok)
             if p.doubloons + priv >= cost:
@@ -547,7 +765,7 @@ def _pay_building_vp_from_supply(
 
 def _trading_house_allows_good(house: TradingHouseState, good: Good, player: PlayerState) -> bool:
     if good in house.goods:
-        return _player_has_building(player, Building.OFFICE)
+        return _occupied_building_bonus_eligible(player, Building.OFFICE)
     return True
 
 
@@ -624,9 +842,7 @@ def _any_legal_cargo_load(state: GameState, player_index: int) -> bool:
 
 
 def _harbor_bonus(player: PlayerState) -> bool:
-    return _player_has_building(player, Building.HARBOR) and building_occupied(
-        next(pb for pb in player.city_buildings if pb.building == Building.HARBOR)
-    )
+    return _occupied_building_bonus_eligible(player, Building.HARBOR)
 
 
 def _wharf_available(state: GameState, player_index: int, pending: CaptainPhasePending) -> bool:
@@ -636,25 +852,19 @@ def _wharf_available(state: GameState, player_index: int, pending: CaptainPhaseP
         wharf_already_used = pending.wharf_used[player_index]
     if wharf_already_used:
         return False
-    if not _player_has_building(state.players[player_index], Building.WHARF):
-        return False
-    pb = next(pb for pb in state.players[player_index].city_buildings if pb.building == Building.WHARF)
-    return building_occupied(pb)
+    return _occupied_building_bonus_eligible(state.players[player_index], Building.WHARF)
 
 
 def _occupied_violet_building(player: PlayerState, b: Building) -> bool:
-    if not _player_has_building(player, b):
-        return False
-    pb = next(x for x in player.city_buildings if x.building == b)
-    return building_occupied(pb)
+    return _occupied_building_bonus_eligible(player, b)
 
 
 def _trader_sell_price(player: PlayerState, good: Good) -> int:
     price = _TRADER_PRICE[good]
     if _occupied_violet_building(player, Building.SMALL_MARKET):
         price += 1
-    if _occupied_violet_building(player, Building.OFFICE):
-        price += 1
+    if _occupied_violet_building(player, Building.LARGE_MARKET):
+        price += 2
     return price
 
 
@@ -856,7 +1066,8 @@ class PuertoRicoEngine:
 
     def _final_score_player(self, player_index: int) -> int:
         p = self._state.players[player_index]
-        return int(p.vp_from_chips + p.vp_on_paper)
+        printed_vp = sum(building_printed_vp(pb.building) for pb in p.city_buildings)
+        return int(p.vp_from_chips + printed_vp + _final_scoring_bonus(p))
 
     # -- legality ------------------------------------------------------------
 
@@ -921,22 +1132,33 @@ class PuertoRicoEngine:
         if cur is None or cur != player_id:
             return []
         p = s.players[player_id]
-        acts: list[EngineAction] = [SettlerPass()]
+        acts: list[EngineAction] = []
+        has_space = count_filled_island_spaces(p) < 12
+
+        if (
+            not pend.awaiting_normal_pick
+            and has_space
+            and _occupied_violet_building(p, Building.HACIENDA)
+            and any(s.plantation_stacks)
+        ):
+            acts.append(SettlerTakeHacienda())
 
         if player_id == chooser:
-            if s.quarries_remaining > 0 and count_filled_island_spaces(p) < 12:
+            if s.quarries_remaining > 0 and has_space:
                 acts.append(SettlerTakeQuarryPrivilege())
             for i, _t in enumerate(s.face_up_plantations):
-                if count_filled_island_spaces(p) < 12:
+                if has_space:
                     acts.append(SettlerTakeFaceUp(i))
         else:
-            if _player_has_building(p, Building.CONSTRUCTION_HUT) and s.quarries_remaining > 0 and count_filled_island_spaces(p) < 12:
+            if _player_has_building(p, Building.CONSTRUCTION_HUT) and s.quarries_remaining > 0 and has_space:
                 hut = next(pb for pb in p.city_buildings if pb.building == Building.CONSTRUCTION_HUT)
                 if building_occupied(hut):
                     acts.append(SettlerTakeQuarryConstructionHut())
             for i, _t in enumerate(s.face_up_plantations):
-                if count_filled_island_spaces(p) < 12:
+                if has_space:
                     acts.append(SettlerTakeFaceUp(i))
+        if not acts or not pend.awaiting_normal_pick:
+            acts.append(SettlerPass())
         return acts
 
     def _legal_mayor(self, player_id: int, pend: MayorPhasePending) -> list[EngineAction]:
@@ -990,7 +1212,10 @@ class PuertoRicoEngine:
             if _player_has_building(p, b):
                 continue
             for slot in range(12):
-                if not _can_place_building_at(p, b, slot):
+                if building_city_spaces(b) == 2:
+                    if _repack_city_buildings(p.city_buildings, b, slot) is None:
+                        continue
+                elif not _can_place_building_at(p, b, slot):
                     continue
                 cost = _builder_doubloon_cost_base(p, b, slot, quarry_discount_applies=quarry_ok)
                 priv = 1 if player_id == chooser else 0
@@ -1013,34 +1238,19 @@ class PuertoRicoEngine:
         s = self._state
         p = s.players[player_id]
         chooser = pend.role_chooser
-        has_hacienda = _occupied_violet_building(p, Building.HACIENDA)
         prod = _compute_craftsman_production(p, s.goods_supply)
-        sup = goods_dict(s.goods_supply)
-        sup_after_base = dict(sup)
+        sup_after_base = goods_dict(s.goods_supply)
         for g, n in prod.items():
             sup_after_base[g] = sup_after_base.get(g, 0) - n
-        hacienda_options: list[Optional[Good]] = [None]
-        if has_hacienda and prod:
-            for g in prod:
-                if prod.get(g, 0) > 0 and sup_after_base.get(g, 0) >= 1:
-                    hacienda_options.append(g)
         acts: list[EngineAction] = []
-        for hg in hacienda_options:
-            sup2 = dict(sup_after_base)
-            if hg is not None:
-                sup2[hg] = sup2.get(hg, 0) - 1
-                if sup2.get(hg, 0) < 0:
-                    continue
-            prod_kinds = {g for g, n in prod.items() if n > 0}
-            if hg is not None:
-                prod_kinds.add(hg)
-            priv_opts: list[Optional[Good]] = [None]
-            if player_id == chooser and prod_kinds:
-                for g in sorted(prod_kinds, key=lambda x: x.value):
-                    if sup2.get(g, 0) >= 1:
-                        priv_opts.append(g)
-            for pg in priv_opts:
-                acts.append(CraftsmanTurn(privilege_good=pg, hacienda_good=hg))
+        prod_kinds = {g for g, n in prod.items() if n > 0}
+        priv_opts: list[Optional[Good]] = [None]
+        if player_id == chooser and prod_kinds:
+            for g in sorted(prod_kinds, key=lambda x: x.value):
+                if sup_after_base.get(g, 0) >= 1:
+                    priv_opts.append(g)
+        for pg in priv_opts:
+            acts.append(CraftsmanTurn(privilege_good=pg, hacienda_good=None))
         out: list[EngineAction] = []
         seen: set[CraftsmanTurn] = set()
         for a in acts:
@@ -1210,7 +1420,11 @@ class PuertoRicoEngine:
                 pending=None,
             )
         if phase is Phase.SETTLER:
-            pend = SettlerPhasePending(settler_role_chooser=chooser, next_actor_index=chooser)
+            pend = SettlerPhasePending(
+                settler_role_chooser=chooser,
+                next_actor_index=chooser,
+                awaiting_normal_pick=False,
+            )
             return dataclasses.replace(
                 state,
                 phase=Phase.SETTLER,
@@ -1316,14 +1530,34 @@ class PuertoRicoEngine:
 
     def _apply_settler(self, player_id: int, action: EngineAction, pend: SettlerPhasePending) -> Optional[str]:
         s = self._state
-        order = role_action_order(pend.settler_role_chooser, s.num_players)
         if isinstance(action, SettlerPass):
+            if pend.awaiting_normal_pick and self._legal_settler(player_id, pend) != [SettlerPass()]:
+                return "must complete normal settler pick after hacienda"
             self._settler_finish_turn(s, pend, player_id)
             return None
         p = s.players[player_id]
         empty_slot = next((i for i, sp in enumerate(p.island_spaces) if sp.tile is None), None)
         if empty_slot is None:
             return "no empty island slot"
+        if isinstance(action, SettlerTakeHacienda):
+            if pend.awaiting_normal_pick:
+                return "hacienda already used this turn"
+            if not _occupied_violet_building(p, Building.HACIENDA):
+                return "no hacienda"
+            s2, tile = _draw_hacienda_plantation(s)
+            if tile is None:
+                return "no plantations for hacienda"
+            new_pl = list(p.island_spaces)
+            new_pl[empty_slot] = IslandSpace(tile=tile, colonists=0)
+            s3 = _replace_player(s2, player_id, dataclasses.replace(p, island_spaces=tuple(new_pl)))
+            if count_filled_island_spaces(s3.players[player_id]) >= 12:
+                self._settler_finish_turn(s3, dataclasses.replace(pend, awaiting_normal_pick=False), player_id)
+                return None
+            self._state = dataclasses.replace(
+                s3,
+                pending=dataclasses.replace(pend, awaiting_normal_pick=True),
+            )
+            return None
         if isinstance(action, SettlerTakeFaceUp):
             if action.face_up_index < 0 or action.face_up_index >= len(s.face_up_plantations):
                 return "bad face-up index"
@@ -1333,7 +1567,8 @@ class PuertoRicoEngine:
             new_pl[empty_slot] = IslandSpace(tile=t, colonists=0)
             s2 = _replace_player(s, player_id, dataclasses.replace(p, island_spaces=tuple(new_pl)))
             s3 = dataclasses.replace(s2, face_up_plantations=tuple(fu))
-            self._settler_finish_turn(s3, pend, player_id)
+            s4 = _maybe_apply_hospice(s3, player_id, empty_slot)
+            self._settler_finish_turn(s4, dataclasses.replace(pend, awaiting_normal_pick=False), player_id)
             return None
         if isinstance(action, (SettlerTakeQuarryPrivilege, SettlerTakeQuarryConstructionHut)):
             if s.quarries_remaining <= 0:
@@ -1346,7 +1581,8 @@ class PuertoRicoEngine:
                 dataclasses.replace(p, island_spaces=tuple(new_pl)),
             )
             s3 = dataclasses.replace(s2, quarries_remaining=s2.quarries_remaining - 1)
-            self._settler_finish_turn(s3, pend, player_id)
+            s4 = _maybe_apply_hospice(s3, player_id, empty_slot)
+            self._settler_finish_turn(s4, dataclasses.replace(pend, awaiting_normal_pick=False), player_id)
             return None
         return "bad settler action"
 
@@ -1363,7 +1599,7 @@ class PuertoRicoEngine:
         nxt = order[idx + 1]
         self._state = dataclasses.replace(
             state,
-            pending=SettlerPhasePending(pend.settler_role_chooser, nxt),
+            pending=SettlerPhasePending(pend.settler_role_chooser, nxt, False),
         )
 
     def _builder_finish_turn(self, state: GameState, pend: BuilderPhasePending, player_id: int) -> None:
@@ -1398,10 +1634,26 @@ class PuertoRicoEngine:
             return "bad builder action"
         p = s.players[player_id]
         quarry_ok = player_id == chooser
-        if not _can_place_building_at(p, action.building, action.anchor_slot):
-            return "illegal placement"
         if _player_has_building(p, action.building):
             return "already own building"
+        if building_city_spaces(action.building) == 2:
+            new_city = _repack_city_buildings(p.city_buildings, action.building, action.anchor_slot)
+            if new_city is None:
+                return "illegal placement"
+        else:
+            if not _can_place_building_at(p, action.building, action.anchor_slot):
+                return "illegal placement"
+            w = building_worker_circles(action.building)
+            new_city = tuple(
+                list(p.city_buildings)
+                + [
+                    PlacedBuilding(
+                        building=action.building,
+                        anchor_slot=action.anchor_slot,
+                        colonists=tuple(0 for _ in range(w)),
+                    )
+                ]
+            )
         cost = _builder_doubloon_cost_base(p, action.building, action.anchor_slot, quarry_discount_applies=quarry_ok)
         priv = 1 if player_id == chooser else 0
         if p.doubloons + priv < cost:
@@ -1413,19 +1665,9 @@ class PuertoRicoEngine:
         s3, err = _bank_pay(s2, player_id, cost)
         if err:
             return err
-        w = building_worker_circles(action.building)
-        pb = PlacedBuilding(
-            building=action.building,
-            anchor_slot=action.anchor_slot,
-            colonists=tuple(0 for _ in range(w)),
-        )
         p3 = s3.players[player_id]
-        new_city = tuple(list(p3.city_buildings) + [pb])
         s4 = _replace_player(s3, player_id, dataclasses.replace(p3, city_buildings=new_city))
-        printed_vp = building_printed_vp(action.building)
-        s5, err2 = _pay_building_vp_from_supply(s4, player_id, printed_vp)
-        if err2:
-            return err2
+        s5 = _maybe_apply_university(s4, player_id, action.building)
         if _count_filled_city_slots(s5.players[player_id]) >= 12:
             s5 = dataclasses.replace(s5, game_end_city12=True)
         self._builder_finish_turn(s5, pend, player_id)
@@ -1454,7 +1696,7 @@ class PuertoRicoEngine:
         return None
 
     def _mayor_refill_ship_and_advance(self, state: GameState, pend: MayorPhasePending) -> None:
-        need = pend.ship_size_at_start
+        need = max(sum(count_empty_building_circles(p) for p in state.players), state.num_players)
         take = min(need, state.colonist_supply)
         ge = take < need
         s1 = dataclasses.replace(
@@ -1471,16 +1713,14 @@ class PuertoRicoEngine:
         if s.colonist_ship > 0:
             self._state = dataclasses.replace(s, pending=dataclasses.replace(pend2, subphase="draft"))
             return
-        placement_next = self._mayor_next_with_colonists_in_hand(
-            pend2.mayor_role_chooser, s.num_players, pend2.colonists_hands
-        )
+        s2, pend3, placement_next = _prepare_mayor_placement_state(s, pend2)
         if placement_next is None:
-            self._mayor_refill_ship_and_advance(s, pend2)
+            self._mayor_refill_ship_and_advance(s2, pend3)
         else:
             self._state = dataclasses.replace(
-                s,
+                s2,
                 pending=dataclasses.replace(
-                    pend2,
+                    pend3,
                     subphase="placement",
                     placement_next=placement_next,
                 ),
@@ -1527,14 +1767,14 @@ class PuertoRicoEngine:
                 colonists_from_ship_remaining=rem,
             )
             if rem == 0:
-                placement_next = self._mayor_next_with_colonists_in_hand(mayor, n, pend2.colonists_hands)
+                s3, pend3, placement_next = _prepare_mayor_placement_state(s2, pend2)
                 if placement_next is None:
-                    self._mayor_refill_ship_and_advance(s2, pend2)
+                    self._mayor_refill_ship_and_advance(s3, pend3)
                     return None
                 self._state = dataclasses.replace(
-                    s2,
+                    s3,
                     pending=dataclasses.replace(
-                        pend2,
+                        pend3,
                         subphase="placement",
                         placement_next=placement_next,
                     ),
@@ -1633,9 +1873,6 @@ class PuertoRicoEngine:
         s = self._state
         p = s.players[player_id]
         chooser = pend.role_chooser
-        if player_id == chooser and _occupied_violet_building(p, Building.LARGE_MARKET):
-            s = _bank_receive(s, player_id, 1)
-            p = s.players[player_id]
         prod = _compute_craftsman_production(p, s.goods_supply)
         state = s
         for g, n in prod.items():
@@ -1644,28 +1881,20 @@ class PuertoRicoEngine:
                 if err:
                     return err
                 state = _player_add_goods(state, player_id, g, 1)
-        p = state.players[player_id]
         if action.hacienda_good is not None:
-            if not _occupied_violet_building(p, Building.HACIENDA):
-                return "no hacienda"
-            if action.hacienda_good not in prod or prod.get(action.hacienda_good, 0) <= 0:
-                return "bad hacienda good"
-            state, err = _goods_supply_take(state, action.hacienda_good, 1)
-            if err:
-                return err
-            state = _player_add_goods(state, player_id, action.hacienda_good, 1)
+            return "hacienda is a settler-only ability"
         if action.privilege_good is not None:
             if player_id != chooser:
                 return "privilege only for chooser"
             kinds = set(prod.keys())
-            if action.hacienda_good is not None:
-                kinds.add(action.hacienda_good)
             if action.privilege_good not in kinds:
                 return "bad privilege good"
             state, err = _goods_supply_take(state, action.privilege_good, 1)
             if err:
                 return err
             state = _player_add_goods(state, player_id, action.privilege_good, 1)
+        if _occupied_violet_building(state.players[player_id], Building.FACTORY):
+            state = _bank_receive(state, player_id, _factory_bonus(len(prod)))
         self._craftsman_finish_turn(state, pend, player_id)
         return None
 
@@ -1673,7 +1902,12 @@ class PuertoRicoEngine:
         order = role_action_order(pend.role_chooser, state.num_players)
         idx = order.index(player_id)
         if idx == len(order) - 1:
-            s2 = dataclasses.replace(state, trading_house=TradingHouseState(goods=()), pending=None)
+            house = state.trading_house
+            s2 = dataclasses.replace(
+                state,
+                trading_house=TradingHouseState(goods=()) if len(house.goods) >= 4 else house,
+                pending=None,
+            )
             self._state = self._advance_role_queue(s2)
             return
         nxt = order[idx + 1]
@@ -1701,12 +1935,18 @@ class PuertoRicoEngine:
         if not _trading_house_allows_good(house, g, p):
             return "office required for duplicate"
         price = _trader_sell_price(p, g)
+        if player_id == pend.role_chooser:
+            price += 1
         s2, err = _player_sub_goods(s, player_id, g, 1)
         if err:
             return err
         s3 = _bank_receive(s2, player_id, price)
         new_goods = tuple(house.goods) + (g,)
         s4 = dataclasses.replace(s3, trading_house=TradingHouseState(goods=new_goods))
+        if len(new_goods) >= 4:
+            s5 = dataclasses.replace(s4, trading_house=TradingHouseState(goods=()), pending=None)
+            self._state = self._advance_role_queue(s5)
+            return None
         self._trader_finish_turn(s4, pend, player_id)
         return None
 
@@ -1736,24 +1976,12 @@ class PuertoRicoEngine:
 
     def _captain_unload_full_ships(self, state: GameState, pend: CaptainPhasePending) -> GameState:
         ships = list(state.cargo_ships)
-        credit = list(pend.ship_full_credit)
         st = state
         for i, sh in enumerate(ships):
             if sh.barrels < sh.capacity or sh.good is None:
                 continue
             g = sh.good
             st = _goods_supply_add(st, g, sh.barrels)
-            if i >= len(credit):
-                ships[i] = CargoShipState(capacity=sh.capacity, good=None, barrels=0)
-                continue
-            captain = credit[i]
-            if captain is not None:
-                goods_val = _TRADER_PRICE[g] * sh.barrels
-                vp_amt = 1 if st.vp_supply > 0 else goods_val
-                st2, err = _award_vp_from_supply(st, captain, vp_amt)
-                if err:
-                    return state
-                st = st2
             ships[i] = CargoShipState(capacity=sh.capacity, good=None, barrels=0)
         return dataclasses.replace(st, cargo_ships=tuple(ships))
 
@@ -1791,6 +2019,9 @@ class PuertoRicoEngine:
                     credit[action.ship_index] = player_id
                 pend2 = dataclasses.replace(pend, ship_full_credit=tuple(credit))
                 s3 = dataclasses.replace(s2, cargo_ships=tuple(ships), pending=pend2)
+                s3, errv = _award_vp_from_supply(s3, player_id, amt)
+                if errv:
+                    return errv
                 if _harbor_bonus(s3.players[player_id]):
                     s3, errh = _award_vp_from_supply(s3, player_id, 1)
                     if errh:

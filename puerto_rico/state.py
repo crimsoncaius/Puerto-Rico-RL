@@ -398,10 +398,14 @@ class SettlerPhasePending:
         Player who took Settler (may take quarry privilege or face-up plantation first).
     next_actor_index:
         Next player to resolve in clockwise order after the chooser; None if between sub-steps.
+    awaiting_normal_pick:
+        True only after the active player has used Hacienda and must now resolve their normal
+        settler pick (face-up plantation or legal quarry).
     """
 
     settler_role_chooser: int
     next_actor_index: Optional[int]
+    awaiting_normal_pick: bool = False
 
 
 @dataclass(frozen=True, slots=True)

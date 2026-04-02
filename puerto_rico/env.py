@@ -34,6 +34,7 @@ from .engine import (
     PuertoRicoEngine,
     RoundCleanupAdvance,
     SettlerPass,
+    SettlerTakeHacienda,
     SettlerTakeFaceUp,
     SettlerTakeQuarryConstructionHut,
     SettlerTakeQuarryPrivilege,
@@ -183,6 +184,7 @@ def build_action_registry() -> tuple[EngineAction, ...]:
         actions.append(PickRole(r))
 
     actions.append(SettlerPass())
+    actions.append(SettlerTakeHacienda())
     actions.append(SettlerTakeQuarryPrivilege())
     actions.append(SettlerTakeQuarryConstructionHut())
     for i in range(_MAX_FACE_UP):
@@ -410,6 +412,7 @@ class PuertoRicoEnv(AECEnv):
         if idx < 0 or idx >= len(_ACTION_REGISTRY):
             raise ValueError(f"action out of range: {idx}")
 
+        self._cumulative_rewards[agent] = 0.0
         for a in self.possible_agents:
             self.rewards[a] = 0.0
 
