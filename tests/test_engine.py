@@ -13,9 +13,9 @@ from puerto_rico.engine import (
     CaptainLoad,
     CaptainStorageCommit,
     CraftsmanTurn,
-    MayorPlaceColonistBuilding,
     MayorPrivilegeSkip,
     MayorPrivilegeTake,
+    MayorSubmitPlacement,
     PuertoRicoEngine,
     SettlerTakeHacienda,
     SettlerTakeFaceUp,
@@ -45,6 +45,7 @@ from puerto_rico.state import (
     normalize_goods_counts,
     role_selection_order,
 )
+from tests._rollout_helpers import sample_engine_action
 
 
 def _empty_goods() -> tuple[tuple[Good, int], ...]:
@@ -109,9 +110,7 @@ def test_round_cleanup_unused_roles_gain_one_doubloon() -> None:
         actor = _first_actor(eng)
         if actor is None:
             break
-        legal = eng.legal_actions(actor)
-        assert legal
-        eng.apply(actor, rng.choice(legal))
+        eng.apply(actor, sample_engine_action(eng, actor, rng))
         steps += 1
     else:
         pytest.fail("timeout advancing to round 2")
@@ -126,11 +125,7 @@ def test_round_cleanup_unused_roles_gain_one_doubloon() -> None:
 
 
 def _first_actor(eng: PuertoRicoEngine) -> Optional[int]:
-    n = eng.state.num_players
-    for i in range(n):
-        if eng.legal_actions(i):
-            return i
-    return None
+    return eng.acting_player()
 
 
 def test_builder_quarry_discount_column_cap() -> None:
@@ -179,28 +174,13 @@ def test_random_play_reaches_game_over_and_scores() -> None:
     while not eng.is_terminal() and steps < 200_000:
         actor = _first_actor(eng)
         assert actor is not None
-        legal = eng.legal_actions(actor)
-        eng.apply(actor, rng.choice(legal))
+        eng.apply(actor, sample_engine_action(eng, actor, rng))
         steps += 1
     assert eng.is_terminal()
     assert eng.state.phase is Phase.GAME_OVER
     scores = eng.final_scores()
     assert len(scores) == 3
     assert all(isinstance(s, int) for s in scores)
-
-
-def test_game_end_sets_phase_game_over() -> None:
-    rng = random.Random(7)
-    eng = PuertoRicoEngine()
-    eng.reset(4, seed=1)
-    for _ in range(300_000):
-        if eng.is_terminal():
-            assert eng.state.phase is Phase.GAME_OVER
-            return
-        actor = _first_actor(eng)
-        assert actor is not None
-        eng.apply(actor, rng.choice(eng.legal_actions(actor)))
-    pytest.fail("expected game to end")
 
 
 def test_initial_game_state_matches_engine_reset() -> None:
@@ -253,7 +233,7 @@ def test_wharf_available_treats_short_wharf_used_as_false() -> None:
     assert _wharf_available(state, 0, pending) is True
 
 
-def test_mayor_placement_legal_actions_return_empty_for_short_hands() -> None:
+def test_mayor_placement_legal_actions_are_not_enumerated() -> None:
     eng = PuertoRicoEngine()
     eng.reset(3, seed=0)
     eng._state = dataclasses.replace(  # noqa: SLF001 - malformed-state regression
@@ -263,11 +243,8 @@ def test_mayor_placement_legal_actions_return_empty_for_short_hands() -> None:
         current_role_execution_index=0,
         pending=MayorPhasePending(
             mayor_role_chooser=0,
-            ship_size_at_start=3,
-            colonists_from_ship_remaining=0,
-            colonists_hands=(),
             subphase="placement",
-            privilege_done=True,
+            placement_pools=(3, 0, 0),
             placement_next=0,
         ),
     )
@@ -275,11 +252,11 @@ def test_mayor_placement_legal_actions_return_empty_for_short_hands() -> None:
     assert eng.legal_actions(0) == ()
 
 
-def test_mayor_next_with_colonists_in_hand_skips_short_hands_safely() -> None:
-    assert PuertoRicoEngine._mayor_next_with_colonists_in_hand(0, 3, ()) is None
+def test_mayor_next_player_with_pool_skips_short_pools_safely() -> None:
+    assert PuertoRicoEngine._mayor_next_player_with_pool(0, 3, ()) is None
 
 
-def test_apply_mayor_privilege_returns_error_for_short_hands() -> None:
+def test_apply_mayor_privilege_pads_short_pools() -> None:
     eng = PuertoRicoEngine()
     eng.reset(3, seed=0)
     eng._state = dataclasses.replace(  # noqa: SLF001 - malformed-state regression
@@ -289,16 +266,17 @@ def test_apply_mayor_privilege_returns_error_for_short_hands() -> None:
         current_role_execution_index=0,
         pending=MayorPhasePending(
             mayor_role_chooser=0,
-            ship_size_at_start=3,
-            colonists_from_ship_remaining=3,
-            colonists_hands=(),
             subphase="privilege",
-            privilege_done=False,
+            placement_pools=(),
             placement_next=None,
         ),
     )
 
-    assert eng._apply_impl(0, MayorPrivilegeTake()) == "invalid mayor colonists_hands index"  # noqa: SLF001
+    assert eng._apply_impl(0, MayorPrivilegeTake()) is None  # noqa: SLF001
+    pending = eng.state.pending
+    assert isinstance(pending, MayorPhasePending)
+    assert pending.subphase == "placement"
+    assert len(pending.placement_pools) == 3
 
 
 def test_apply_captain_load_returns_error_for_short_ship_full_credit() -> None:
@@ -571,11 +549,8 @@ def test_mayor_refill_uses_empty_building_circles_with_player_minimum() -> None:
     )
     pending = MayorPhasePending(
         mayor_role_chooser=0,
-        ship_size_at_start=3,
-        colonists_from_ship_remaining=0,
-        colonists_hands=(0, 0, 0),
         subphase="placement",
-        privilege_done=True,
+        placement_pools=(0, 0, 0),
         placement_next=None,
     )
 
@@ -605,11 +580,8 @@ def test_mayor_collects_existing_colonists_for_rearrangement() -> None:
         colonist_ship=0,
         pending=MayorPhasePending(
             mayor_role_chooser=0,
-            ship_size_at_start=0,
-            colonists_from_ship_remaining=0,
-            colonists_hands=(0, 0, 0),
             subphase="privilege",
-            privilege_done=False,
+            placement_pools=(0, 0, 0),
             placement_next=None,
         ),
     )
@@ -619,11 +591,18 @@ def test_mayor_collects_existing_colonists_for_rearrangement() -> None:
     pending = eng.state.pending
     assert isinstance(pending, MayorPhasePending)
     assert pending.subphase == "placement"
-    assert pending.colonists_hands[0] == 3
+    assert pending.placement_pools[0] == 3
     assert eng.state.players[0].san_juan_colonists == 0
     assert eng.state.players[0].island_spaces[0].colonists == 0
     assert eng.state.players[0].city_buildings[0].colonists == (0,)
-    assert MayorPlaceColonistBuilding(0, 0) in eng.legal_actions(0)
+    assert eng.is_legal(
+        0,
+        MayorSubmitPlacement(
+            island_targets=(1,) + (0,) * 11,
+            building_targets=(1,) + (0,) * 11,
+            san_juan=1,
+        ),
+    )
 
 
 def test_builder_can_rearrange_city_to_make_room_for_large_building() -> None:

@@ -46,7 +46,7 @@ class Phase(str, Enum):
     """Settler role: plantations/quarries and end-of-phase face-up refresh."""
 
     MAYOR = "mayor"
-    """Mayor role: colonist ship distribution, placement, San Juan, ship refill."""
+    """Mayor role: privilege, automatic ship distribution, final placement, ship refill."""
 
     BUILDER = "builder"
     """Builder role: each player may build at most one building."""
@@ -420,11 +420,8 @@ class MayorPhasePending:
     """
 
     mayor_role_chooser: int
-    ship_size_at_start: int
-    colonists_from_ship_remaining: int
-    colonists_hands: tuple[int, ...]
-    subphase: Literal["privilege", "draft", "placement", "ship_refill"]
-    privilege_done: bool
+    subphase: Literal["privilege", "placement"]
+    placement_pools: tuple[int, ...]
     placement_next: Optional[int]
 
 
@@ -538,7 +535,7 @@ class GameState:
     quarries_remaining:
         Quarries left in the central quarry supply (all eight start face-up; taken in settler phase).
     colonist_ship:
-        Colonists on the ship (drafted one at a time in mayor). Initial size 3/4/5 by player count.
+        Colonists on the ship. Mayor distributes them automatically in mayor order.
     colonist_supply:
         Colonists not on the ship or boards. Mayor refills the ship from here; game can end if refill fails.
     bank_doubloons:

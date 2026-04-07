@@ -133,28 +133,12 @@ class MayorPrivilegeSkip:
 
 
 @dataclass(frozen=True, slots=True)
-class MayorDraftTake:
-    """Take the next colonist from the ship into your hand (only on your draft turn)."""
+class MayorSubmitPlacement:
+    """Submit the player's final mayor allocation for their full pooled colonists."""
 
-
-@dataclass(frozen=True, slots=True)
-class MayorPlaceColonistIsland:
-    """Place one colonist from your hand onto an island tile (next empty circle on that tile)."""
-
-    island_slot: int
-
-
-@dataclass(frozen=True, slots=True)
-class MayorPlaceColonistBuilding:
-    """Place one colonist from your hand onto an empty worker circle of a building."""
-
-    building_index: int
-    circle_index: int
-
-
-@dataclass(frozen=True, slots=True)
-class MayorPlaceColonistSanJuan:
-    """Place one colonist from your hand into San Juan (only when no empty circles remain)."""
+    island_targets: tuple[int, ...]
+    building_targets: tuple[int, ...]
+    san_juan: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,10 +227,7 @@ EngineAction: TypeAlias = Union[
     SettlerPass,
     MayorPrivilegeTake,
     MayorPrivilegeSkip,
-    MayorDraftTake,
-    MayorPlaceColonistIsland,
-    MayorPlaceColonistBuilding,
-    MayorPlaceColonistSanJuan,
+    MayorSubmitPlacement,
     BuilderBuild,
     BuilderPass,
     BuilderNoOp,
@@ -665,19 +646,22 @@ def _prepare_mayor_placement_state(
     state: GameState,
     pend: MayorPhasePending,
 ) -> tuple[GameState, MayorPhasePending, Optional[int]]:
-    """During mayor, all colonists may be rearranged; move them into hands before placement."""
+    """During mayor, auto-distribute the ship and pool all colonists for final placement."""
 
-    hands = list(pend.colonists_hands)
+    pools = list(pend.placement_pools[: state.num_players])
+    if len(pools) < state.num_players:
+        pools.extend(0 for _ in range(state.num_players - len(pools)))
+    for offset in range(state.colonist_ship):
+        pools[(pend.mayor_role_chooser + offset) % state.num_players] += 1
     players = list(state.players)
     for idx, player in enumerate(players):
         cleared_player, pooled = _collect_player_colonists_for_mayor(player)
         players[idx] = cleared_player
-        if idx < len(hands):
-            hands[idx] += pooled
-    pend2 = dataclasses.replace(pend, colonists_hands=tuple(hands))
-    state2 = dataclasses.replace(state, players=tuple(players), pending=pend2)
-    placement_next = PuertoRicoEngine._mayor_next_with_colonists_in_hand(
-        pend2.mayor_role_chooser, state2.num_players, pend2.colonists_hands
+        pools[idx] += pooled
+    pend2 = dataclasses.replace(pend, subphase="placement", placement_pools=tuple(pools))
+    state2 = dataclasses.replace(state, players=tuple(players), colonist_ship=0, pending=pend2)
+    placement_next = PuertoRicoEngine._mayor_next_player_with_pool(
+        pend2.mayor_role_chooser, state2.num_players, pend2.placement_pools
     )
     return state2, pend2, placement_next
 
@@ -1049,7 +1033,42 @@ class PuertoRicoEngine:
         return tuple(self._legal_actions_impl(player_id))
 
     def is_legal(self, player_id: int, action: EngineAction) -> bool:
+        if self._state.phase is Phase.MAYOR and isinstance(self._state.pending, MayorPhasePending):
+            if self._state.pending.subphase == "placement":
+                return self._validate_mayor_placement(player_id, action, self._state.pending) is None
         return action in self.legal_actions(player_id)
+
+    def acting_player(self) -> Optional[int]:
+        s = self._state
+        if s.phase in (Phase.GAME_OVER, Phase.ROUND_CLEANUP):
+            return None
+        if s.phase is Phase.ROLE_SELECTION:
+            return s.next_role_selector_index
+        idx = s.current_role_execution_index
+        if idx is None or idx < 0 or idx >= len(s.round_role_order):
+            return None
+        _role, chooser = s.round_role_order[idx]
+        if s.phase is Phase.SETTLER and isinstance(s.pending, SettlerPhasePending):
+            return s.pending.next_actor_index
+        if s.phase is Phase.MAYOR and isinstance(s.pending, MayorPhasePending):
+            if s.pending.subphase == "privilege":
+                return s.pending.mayor_role_chooser
+            return s.pending.placement_next
+        if s.phase is Phase.BUILDER and isinstance(s.pending, BuilderPhasePending):
+            return s.pending.next_actor
+        if s.phase is Phase.CRAFTSMAN and isinstance(s.pending, CraftsmanPhasePending):
+            return s.pending.next_actor
+        if s.phase is Phase.TRADER and isinstance(s.pending, TraderPhasePending):
+            return s.pending.next_actor
+        if s.phase is Phase.CAPTAIN and isinstance(s.pending, CaptainPhasePending):
+            if s.pending.subphase == "loading":
+                return s.pending.active_player_index
+            if s.pending.subphase == "storage":
+                return s.pending.storage_next_actor
+            return None
+        if s.phase is Phase.PROSPECTOR:
+            return chooser
+        return None
 
     def apply(self, player_id: int, action: EngineAction) -> None:
         err = self._apply_impl(player_id, action)
@@ -1164,37 +1183,63 @@ class PuertoRicoEngine:
     def _legal_mayor(self, player_id: int, pend: MayorPhasePending) -> list[EngineAction]:
         return self._mayor_legal_actions_for_player(player_id, pend)
 
-    def _legal_mayor_placements(self, player_id: int, hand: int) -> list[EngineAction]:
-        s = self._state
-        p = s.players[player_id]
-        acts: list[EngineAction] = []
-        # No San Juan dumping if any empty circle exists anywhere on your board (must fill if possible).
-        has_empty = self._any_empty_circle(p)
-        if has_empty:
-            for si, sp in enumerate(p.island_spaces):
-                if sp.tile is None:
-                    continue
-                if sp.colonists < island_tile_max_colonists(sp.tile):
-                    acts.append(MayorPlaceColonistIsland(si))
-            for bi, pb in enumerate(p.city_buildings):
-                for ci, cc in enumerate(pb.colonists):
-                    if cc == 0:
-                        acts.append(MayorPlaceColonistBuilding(bi, ci))
-        elif hand > 0:
-            acts.append(MayorPlaceColonistSanJuan())
-        return acts
+    @staticmethod
+    def _mayor_board_capacity(player: PlayerState) -> int:
+        island_capacity = sum(
+            island_tile_max_colonists(space.tile) for space in player.island_spaces if space.tile is not None
+        )
+        building_capacity = sum(len(pb.colonists) for pb in player.city_buildings)
+        return island_capacity + building_capacity
 
-    def _any_empty_circle(self, p: PlayerState) -> bool:
-        for sp in p.island_spaces:
-            if sp.tile is None:
-                continue
-            if sp.colonists < island_tile_max_colonists(sp.tile):
-                return True
-        for pb in p.city_buildings:
-            for c in pb.colonists:
-                if c == 0:
-                    return True
-        return False
+    def _validate_mayor_placement(
+        self,
+        player_id: int,
+        action: EngineAction,
+        pend: MayorPhasePending,
+    ) -> Optional[str]:
+        if pend.subphase != "placement" or pend.placement_next != player_id:
+            return "not placement turn"
+        if not isinstance(action, MayorSubmitPlacement):
+            return "bad placement action"
+        if player_id < 0 or player_id >= len(pend.placement_pools):
+            return "invalid mayor placement pool index"
+        pool = pend.placement_pools[player_id]
+        p = self._state.players[player_id]
+        if len(action.island_targets) != len(p.island_spaces):
+            return "bad island target length"
+        if len(action.building_targets) < len(p.city_buildings):
+            return "bad building target length"
+        if any(target != 0 for target in action.building_targets[len(p.city_buildings) :]):
+            return "target for missing building"
+
+        allocated_on_board = 0
+        for idx, target in enumerate(action.island_targets):
+            if target < 0:
+                return "negative island target"
+            space = p.island_spaces[idx]
+            capacity = 0 if space.tile is None else island_tile_max_colonists(space.tile)
+            if target > capacity:
+                return "island target exceeds capacity"
+            allocated_on_board += target
+
+        for idx, pb in enumerate(p.city_buildings):
+            target = action.building_targets[idx]
+            if target < 0:
+                return "negative building target"
+            capacity = len(pb.colonists)
+            if target > capacity:
+                return "building target exceeds capacity"
+            allocated_on_board += target
+
+        if action.san_juan < 0:
+            return "negative san juan target"
+        if allocated_on_board + action.san_juan != pool:
+            return "placement total mismatch"
+
+        required_on_board = min(pool, self._mayor_board_capacity(p))
+        if allocated_on_board != required_on_board:
+            return "must fill board before San Juan"
+        return None
 
     def _legal_storage_commits(self, player_id: int) -> list[EngineAction]:
         p = self._state.players[player_id]
@@ -1328,21 +1373,8 @@ class PuertoRicoEngine:
                 m.append(MayorPrivilegeTake())
             m.append(MayorPrivilegeSkip())
             return m
-        if pend.subphase == "draft":
-            k = pend.ship_size_at_start - s.colonist_ship
-            nxt = (pend.mayor_role_chooser + k) % s.num_players
-            if player_id != nxt or s.colonist_ship <= 0:
-                return []
-            return [MayorDraftTake()]
         if pend.subphase == "placement":
-            if pend.placement_next is None or player_id != pend.placement_next:
-                return []
-            if player_id < 0 or player_id >= len(pend.colonists_hands):
-                return []
-            hand = pend.colonists_hands[player_id]
-            if hand <= 0:
-                return []
-            return self._legal_mayor_placements(player_id, hand)
+            return []
         return []
 
     # -- apply --------------------------------------------------------------
@@ -1432,14 +1464,10 @@ class PuertoRicoEngine:
                 pending=pend,
             )
         if phase is Phase.MAYOR:
-            ship = state.colonist_ship
             mp = MayorPhasePending(
                 mayor_role_chooser=chooser,
-                ship_size_at_start=ship,
-                colonists_from_ship_remaining=ship,
-                colonists_hands=tuple(0 for _ in range(state.num_players)),
                 subphase="privilege",
-                privilege_done=False,
+                placement_pools=tuple(0 for _ in range(state.num_players)),
                 placement_next=None,
             )
             return dataclasses.replace(
@@ -1674,24 +1702,22 @@ class PuertoRicoEngine:
         return None
 
     @staticmethod
-    def _mayor_next_with_colonists_in_hand(mayor: int, num_players: int, hands: tuple[int, ...]) -> Optional[int]:
+    def _mayor_next_player_with_pool(mayor: int, num_players: int, pools: tuple[int, ...]) -> Optional[int]:
         for k in range(num_players):
             idx = (mayor + k) % num_players
-            if idx < 0 or idx >= len(hands):
+            if idx < 0 or idx >= len(pools):
                 continue
-            if hands[idx] > 0:
+            if pools[idx] > 0:
                 return idx
         return None
 
     @staticmethod
-    def _mayor_next_placement_after(
-        mayor: int, num_players: int, hands: list[int], after_player: int
-    ) -> Optional[int]:
+    def _mayor_next_player_after(num_players: int, pools: list[int], after_player: int) -> Optional[int]:
         for step in range(1, num_players + 1):
             idx = (after_player + step) % num_players
-            if idx < 0 or idx >= len(hands):
+            if idx < 0 or idx >= len(pools):
                 continue
-            if hands[idx] > 0:
+            if pools[idx] > 0:
                 return idx
         return None
 
@@ -1709,19 +1735,14 @@ class PuertoRicoEngine:
         self._state = self._advance_role_queue(s1)
 
     def _mayor_after_privilege(self, s: GameState, pend: MayorPhasePending) -> None:
-        pend2 = dataclasses.replace(pend, privilege_done=True)
-        if s.colonist_ship > 0:
-            self._state = dataclasses.replace(s, pending=dataclasses.replace(pend2, subphase="draft"))
-            return
-        s2, pend3, placement_next = _prepare_mayor_placement_state(s, pend2)
+        s2, pend2, placement_next = _prepare_mayor_placement_state(s, pend)
         if placement_next is None:
-            self._mayor_refill_ship_and_advance(s2, pend3)
+            self._mayor_refill_ship_and_advance(s2, pend2)
         else:
             self._state = dataclasses.replace(
                 s2,
                 pending=dataclasses.replace(
-                    pend3,
-                    subphase="placement",
+                    pend2,
                     placement_next=placement_next,
                 ),
             )
@@ -1729,7 +1750,6 @@ class PuertoRicoEngine:
     def _apply_mayor(self, player_id: int, action: EngineAction, pend: MayorPhasePending) -> Optional[str]:
         s = self._state
         mayor = pend.mayor_role_chooser
-        n = s.num_players
         if pend.subphase == "privilege":
             if player_id != mayor:
                 return "mayor privilege only"
@@ -1739,114 +1759,56 @@ class PuertoRicoEngine:
             if isinstance(action, MayorPrivilegeTake):
                 if s.colonist_supply <= 0:
                     return "empty colonist supply"
-                hands = list(pend.colonists_hands)
-                if mayor < 0 or mayor >= len(hands):
-                    return "invalid mayor colonists_hands index"
-                hands[mayor] += 1
-                pend2 = dataclasses.replace(pend, colonists_hands=tuple(hands))
+                pools = list(pend.placement_pools[: s.num_players])
+                if len(pools) < s.num_players:
+                    pools.extend(0 for _ in range(s.num_players - len(pools)))
+                pools[mayor] += 1
+                pend2 = dataclasses.replace(pend, placement_pools=tuple(pools))
                 s2 = dataclasses.replace(s, colonist_supply=s.colonist_supply - 1, pending=pend2)
                 self._mayor_after_privilege(s2, pend2)
                 return None
             return "bad mayor privilege action"
-        if pend.subphase == "draft":
-            k = pend.ship_size_at_start - s.colonist_ship
-            nxt = (mayor + k) % n
-            if player_id != nxt or s.colonist_ship <= 0:
-                return "not draft turn"
-            if not isinstance(action, MayorDraftTake):
-                return "bad draft action"
-            hands = list(pend.colonists_hands)
-            if player_id < 0 or player_id >= len(hands):
-                return "invalid mayor colonists_hands index"
-            hands[player_id] += 1
-            s2 = dataclasses.replace(s, colonist_ship=s.colonist_ship - 1)
-            rem = s2.colonist_ship
-            pend2 = dataclasses.replace(
-                pend,
-                colonists_hands=tuple(hands),
-                colonists_from_ship_remaining=rem,
-            )
-            if rem == 0:
-                s3, pend3, placement_next = _prepare_mayor_placement_state(s2, pend2)
-                if placement_next is None:
-                    self._mayor_refill_ship_and_advance(s3, pend3)
-                    return None
-                self._state = dataclasses.replace(
-                    s3,
-                    pending=dataclasses.replace(
-                        pend3,
-                        subphase="placement",
-                        placement_next=placement_next,
-                    ),
-                )
-            else:
-                self._state = dataclasses.replace(s2, pending=pend2)
-            return None
         if pend.subphase == "placement":
-            if pend.placement_next is None or player_id != pend.placement_next:
-                return "not placement turn"
-            hands = list(pend.colonists_hands)
-            if player_id < 0 or player_id >= len(hands):
-                return "invalid mayor colonists_hands index"
-            if hands[player_id] <= 0:
-                return "empty hand"
+            err = self._validate_mayor_placement(player_id, action, pend)
+            if err:
+                return err
             p = s.players[player_id]
-            if isinstance(action, MayorPlaceColonistIsland):
-                si = action.island_slot
-                if si < 0 or si >= len(p.island_spaces):
-                    return "bad island slot"
-                sp = p.island_spaces[si]
-                if sp.tile is None:
-                    return "empty island space"
-                mx = island_tile_max_colonists(sp.tile)
-                if sp.colonists >= mx:
-                    return "island full"
-                new_pl = list(p.island_spaces)
-                new_pl[si] = IslandSpace(tile=sp.tile, colonists=sp.colonists + 1)
-                hands[player_id] -= 1
-                s2 = _replace_player(s, player_id, dataclasses.replace(p, island_spaces=tuple(new_pl)))
-            elif isinstance(action, MayorPlaceColonistBuilding):
-                bi, ci = action.building_index, action.circle_index
-                if bi < 0 or bi >= len(p.city_buildings):
-                    return "bad building index"
-                pb = p.city_buildings[bi]
-                if ci < 0 or ci >= len(pb.colonists):
-                    return "bad circle index"
-                if pb.colonists[ci] != 0:
-                    return "circle occupied"
-                col = list(pb.colonists)
-                col[ci] = 1
-                new_pb = dataclasses.replace(pb, colonists=tuple(col))
-                new_list = list(p.city_buildings)
-                new_list[bi] = new_pb
-                hands[player_id] -= 1
-                s2 = _replace_player(s, player_id, dataclasses.replace(p, city_buildings=tuple(new_list)))
-            elif isinstance(action, MayorPlaceColonistSanJuan):
-                if self._any_empty_circle(p):
-                    return "must place on board first"
-                hands[player_id] -= 1
-                s2 = _replace_player(
-                    s,
-                    player_id,
-                    dataclasses.replace(p, san_juan_colonists=p.san_juan_colonists + 1),
-                )
-            else:
-                return "bad placement action"
-            if sum(hands) == 0:
-                self._mayor_refill_ship_and_advance(s2, pend)
+            assert isinstance(action, MayorSubmitPlacement)
+
+            new_island = [
+                IslandSpace(tile=space.tile, colonists=action.island_targets[idx])
+                for idx, space in enumerate(p.island_spaces)
+            ]
+            new_city = []
+            for idx, pb in enumerate(p.city_buildings):
+                workers = action.building_targets[idx]
+                colonists = tuple(1 if circle < workers else 0 for circle in range(len(pb.colonists)))
+                new_city.append(dataclasses.replace(pb, colonists=colonists))
+            updated_player = dataclasses.replace(
+                p,
+                san_juan_colonists=action.san_juan,
+                island_spaces=tuple(new_island),
+                city_buildings=tuple(new_city),
+            )
+            s2 = _replace_player(s, player_id, updated_player)
+
+            pools = list(pend.placement_pools)
+            pools[player_id] = 0
+            if sum(pools) == 0:
+                self._mayor_refill_ship_and_advance(s2, dataclasses.replace(pend, placement_pools=tuple(pools)))
                 return None
-            nxt = self._mayor_next_placement_after(mayor, n, hands, player_id)
+            nxt = self._mayor_next_player_after(s.num_players, pools, player_id)
             if nxt is None:
                 self._mayor_refill_ship_and_advance(
                     s2,
-                    dataclasses.replace(pend, colonists_hands=tuple(hands)),
+                    dataclasses.replace(pend, placement_pools=tuple(pools)),
                 )
                 return None
             self._state = dataclasses.replace(
                 s2,
                 pending=dataclasses.replace(
                     pend,
-                    colonists_hands=tuple(hands),
+                    placement_pools=tuple(pools),
                     placement_next=nxt,
                 ),
             )
